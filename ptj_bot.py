@@ -107,7 +107,7 @@ class CoinoneAPI:
             payload.encode('utf-8'),
             hashlib.sha512
         )
-        return base64.b64encode(signature.hexdigest().encode('utf-8')).decode('utf-8')
+        return signature.hexdigest()
 
     def _request(self, endpoint: str, params: Dict = None) -> Dict:
         """Private API 요청"""
@@ -343,9 +343,12 @@ class PTJBot:
             if result.get('result') != 'success':
                 return 0, 0
 
-            balances = result.get('balances', {})
-            krw = float(balances.get('krw', {}).get('available', 0))
-            coin = float(balances.get(Config.TICKER.lower(), {}).get('available', 0))
+            # balances는 리스트 형태로 반환됨
+            balances_list = result.get('balances', [])
+            balances = {b['currency'].upper(): b for b in balances_list}
+            
+            krw = float(balances.get('KRW', {}).get('available', 0))
+            coin = float(balances.get(Config.TICKER.upper(), {}).get('available', 0))
             return krw, coin
         except Exception as e:
             logger.error(f"잔고 조회 실패: {e}")
