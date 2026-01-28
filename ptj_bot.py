@@ -1,12 +1,14 @@
 """
 🏆 Paul Tudor Jones (PTJ) Trading Bot for Coinone
 전설적인 헤지펀드 매니저 Paul Tudor Jones의 추세추종 전략
+재진입 버전 + 매시간 텔레그램 상태 알림
 
 핵심 원칙:
 1. "The most important rule is to play great defense" - 방어가 최우선
 2. 200일 이동평균선으로 대세 판단
 3. 빠른 손절, 수익은 길게 (손익비 2:1 이상)
 4. "Losers average losers" - 물타기 금지
+5. 청산 후 200 MA 위면 즉시 재진입 (Aggressive)
 """
 
 import hmac
@@ -48,6 +50,12 @@ class Config:
     TAKE_PROFIT_PCT = 0.15  # 익절 15%
     TRAILING_STOP_PCT = 0.10  # 트레일링 10%
     TRAILING_ACTIVATION_PCT = 0.08  # 8% 수익시 트레일링 활성화
+
+    # ★ 재진입 설정 ★
+    ENABLE_REENTRY = True  # 청산 후 200 MA 위면 즉시 재진입
+
+    # ★ 매시간 상태 알림 ★
+    HOURLY_STATUS_ENABLED = True
 
     # 투자 비율
     INVEST_RATIO = 0.95
@@ -277,7 +285,7 @@ class PositionManager:
 
 
 class PTJBot:
-    """Paul Tudor Jones 추세추종 봇"""
+    """Paul Tudor Jones 추세추종 봇 (재진입 버전)"""
 
     def __init__(self):
         self.api = CoinoneAPI(Config.COINONE_ACCESS_TOKEN, Config.COINONE_SECRET_KEY)
@@ -285,7 +293,7 @@ class PTJBot:
         self.trade_count = 0
         self.win_count = 0
         self.start_time = datetime.now()
-        logger.info("🏆 PTJ Trading Bot 초기화 완료")
+        logger.info("🏆 PTJ Trading Bot 초기화 완료 (재진입 버전)")
 
     def get_ohlcv(self) -> Optional[pd.DataFrame]:
         """OHLCV 데이터 조회"""
@@ -395,15 +403,15 @@ class PTJBot:
             logger.error(f"매수 오류: {e}")
             return False
 
-    def sell(self, reason: str) -> bool:
-        """매도 실행"""
+    def sell(self, reason: str) -> Tuple[bool, float]:
+        """매도 실행 - (성공여부, 수익률) 반환"""
         try:
             _, coin_balance = self.get_balance()
             current_price = self.get_current_price()
 
             if coin_balance <= 0 or current_price is None:
                 logger.warning("매도할 코인이 없습니다")
-                return False
+                return False, 0
 
             result = self.api.sell_market_order(Config.TICKER, coin_balance)
 
@@ -421,26 +429,29 @@ class PTJBot:
                 send_telegram(msg)
 
                 self.position.exit_position()
-                return True
+                return True, profit_pct
             else:
                 logger.error(f"매도 실패: {result}")
-                return False
+                return False, 0
 
         except Exception as e:
             logger.error(f"매도 오류: {e}")
-            return False
+            return False, 0
 
-    def check_exit_conditions(self, current_price: float, signals: Dict) -> Tuple[bool, str]:
-        """청산 조건 확인 (PTJ 스타일)"""
+    def check_exit_conditions(self, current_price: float, signals: Dict) -> Tuple[bool, str, bool]:
+        """
+        청산 조건 확인 (PTJ 스타일)
+        Returns: (should_exit, reason, allow_reentry)
+        """
         if not self.position.in_position:
-            return False, ""
+            return False, "", False
 
         self.position.update_highest(current_price)
 
-        # 1. 손절 (7%)
+        # 1. 손절 (7%) - 재진입 허용
         stop_loss_price = self.position.get_stop_loss_price()
         if stop_loss_price and current_price <= stop_loss_price:
-            return True, "Stop Loss (7%)"
+            return True, "Stop Loss (7%)", True
 
         # 2. 익절 (15%)
         take_profit_price = self.position.get_take_profit_price()
@@ -448,17 +459,17 @@ class PTJBot:
             # 익절 도달 후에는 트레일링 스탑으로 전환
             pass
 
-        # 3. 트레일링 스탑 (8% 수익 이상시 활성화)
+        # 3. 트레일링 스탑 (8% 수익 이상시 활성화) - 재진입 허용
         if self.position.is_trailing_active(current_price):
             trailing_stop_price = self.position.get_trailing_stop_price()
             if trailing_stop_price and current_price <= trailing_stop_price:
-                return True, "Trailing Stop (10%)"
+                return True, "Trailing Stop (10%)", True
 
-        # 4. 200MA 하향 돌파
+        # 4. 200MA 하향 돌파 - 재진입 불허 (추세 전환)
         if signals['sell_signal']:
-            return True, "Below 200 MA"
+            return True, "Below 200 MA", False
 
-        return False, ""
+        return False, "", False
 
     def get_status_message(self, signals: Dict) -> str:
         """상태 메시지 생성"""
@@ -497,10 +508,10 @@ class PTJBot:
   총: {total_value:,.0f}원
 """
 
-    def run_once(self):
+    def run_once(self, send_hourly_status: bool = True):
         """매매 로직 1회 실행"""
         logger.info("=" * 50)
-        logger.info("📊 PTJ 시장 분석")
+        logger.info("📊 PTJ 시장 분석 (재진입 버전)")
 
         df = self.get_ohlcv()
         if df is None:
@@ -526,47 +537,82 @@ class PTJBot:
 
         logger.info(f"💰 잔고: {krw_balance:,.0f}원 / {coin_balance:.8f} {Config.TICKER}")
 
+        # ===== 포지션 있을 때 =====
         if self.position.in_position:
-            should_exit, reason = self.check_exit_conditions(current_price, signals)
+            should_exit, reason, allow_reentry = self.check_exit_conditions(current_price, signals)
+
             if should_exit:
                 logger.info(f"🔴 청산 신호: {reason}")
-                self.sell(reason)
+                success, profit_pct = self.sell(reason)
+
+                # ★★★ 재진입 로직 ★★★
+                if success and Config.ENABLE_REENTRY and allow_reentry:
+                    if signals['above_200ma']:
+                        logger.info("🔄 가격이 여전히 200 MA 위 → 즉시 재진입")
+                        time.sleep(2)  # API 호출 간격
+
+                        # 잔고 재확인
+                        krw_balance, _ = self.get_balance()
+                        if krw_balance > 10000:
+                            self.buy("Reentry (Above 200 MA)")
+                            send_telegram("🔄 <b>재진입 완료</b>\n가격이 200 MA 위에서 유지 중")
+                        else:
+                            logger.warning("재진입 실패: 잔고 부족")
+                    else:
+                        logger.info("200 MA 아래 → 재진입 대기")
             else:
                 if self.position.entry_price:
                     pnl = (current_price - self.position.entry_price) / self.position.entry_price * 100
-                    logger.info(f"손익: {pnl:+.2f}% | 손절가: {self.position.get_stop_loss_price():,.0f}원")
+                    trailing_status = "활성" if self.position.is_trailing_active(current_price) else "대기"
+                    logger.info(f"손익: {pnl:+.2f}% | 손절가: {self.position.get_stop_loss_price():,.0f}원 | 트레일링: {trailing_status}")
+
+        # ===== 포지션 없을 때 =====
         else:
             if signals['buy_signal'] or (signals['strong_uptrend'] and signals['above_200ma']):
                 reason = "200 MA Breakout" if signals['buy_signal'] else "Strong Uptrend"
                 logger.info(f"🟢 매수 신호: {reason}")
                 self.buy(reason)
+            elif signals['above_200ma']:
+                # ★★★ 이미 200 MA 위면 진입 ★★★
+                logger.info("🟢 가격 > 200 MA → 매수")
+                self.buy("Above 200 MA")
             else:
                 logger.info("대기 중... (200 MA 위 돌파 대기)")
 
+        # ★★★ 매시간 상태 알림 ★★★
+        if send_hourly_status and Config.HOURLY_STATUS_ENABLED:
+            status_msg = self.get_status_message(signals)
+            send_telegram(status_msg)
+            logger.info("📱 매시간 상태 알림 전송")
+
     def run(self):
         """메인 루프"""
-        logger.info("🏆 PTJ Trading Bot 시작")
-        logger.info(f"전략: 200 MA 추세추종")
+        logger.info("🏆 PTJ Trading Bot 시작 (재진입 버전)")
+        logger.info(f"전략: 200 MA 추세추종 + 재진입")
         logger.info(f"손절: {Config.STOP_LOSS_PCT*100}%, 트레일링: {Config.TRAILING_STOP_PCT*100}%")
+        logger.info(f"재진입: {'활성화' if Config.ENABLE_REENTRY else '비활성화'}")
+        logger.info(f"매시간 상태 알림: {'활성화' if Config.HOURLY_STATUS_ENABLED else '비활성화'}")
 
         start_msg = f"""
-<b>🏆 PTJ Bot 시작</b>
+<b>🏆 PTJ Bot 시작 (재진입 버전)</b>
 ━━━━━━━━━━━━━━━
 전략: 200 MA 추세추종
 손절: {Config.STOP_LOSS_PCT*100}%
 트레일링: {Config.TRAILING_STOP_PCT*100}%
+<b>재진입: 활성화 ✅</b>
+<b>매시간 알림: 활성화 ✅</b>
 ━━━━━━━━━━━━━━━
 "Play great defense"
 - Paul Tudor Jones
 """
         send_telegram(start_msg)
 
-        self.run_once()
+        self.run_once(send_hourly_status=True)
 
         while True:
             try:
                 time.sleep(Config.CHECK_INTERVAL)
-                self.run_once()
+                self.run_once(send_hourly_status=True)
 
             except KeyboardInterrupt:
                 logger.info("봇 종료")
@@ -581,8 +627,8 @@ class PTJBot:
 def main():
     print("""
     ╔══════════════════════════════════════════╗
-    ║  🏆 Paul Tudor Jones Trading Bot         ║
-    ║  "Play great defense, not offense"       ║
+    ║  🏆 PTJ Trading Bot (Reentry Version)    ║
+    ║  재진입 + 매시간 상태 알림               ║
     ╚══════════════════════════════════════════╝
     """)
 
